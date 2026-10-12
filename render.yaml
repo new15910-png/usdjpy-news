@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: usdjpy-news-prototype
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python web_app.py
+    healthCheckPath: /health
+    autoDeploy: true

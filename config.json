@@ -1,0 +1,7 @@
+{
+  "lookback_hours": 168,
+  "max_items_per_source": 30,
+  "relevance_threshold": 2,
+  "fetch_article_text": true,
+  "request_timeout_seconds": 15
+}

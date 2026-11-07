@@ -185,9 +185,58 @@ def collect_fed() -> list[Item]:
 
 
 def collect_bls() -> list[Item]:
-    out = []
-    out.extend(rss_items("BLS", "https://www.bls.gov/feed/empsit.rss"))
-    out.extend(rss_items("BLS", "https://www.bls.gov/feed/cpi.rss"))
+    """Collect key BLS indicators from the official Public Data API.
+
+    The older prototype used BLS RSS endpoints, but some cloud providers
+    receive HTTP 403 responses from www.bls.gov.  The Public Data API is
+    intended for programmatic access and does not require an API key for
+    these small requests.
+    """
+    series = [
+        ("CES0000000001", "米国・非農業部門雇用者数", "千人", "https://www.bls.gov/news.release/empsit.nr0.htm"),
+        ("LNS14000000", "米国・失業率", "%", "https://www.bls.gov/news.release/empsit.nr0.htm"),
+        ("CUUR0000SA0", "米国・消費者物価指数（CPI-U）", "指数", "https://www.bls.gov/news.release/cpi.nr0.htm"),
+    ]
+
+    out: list[Item] = []
+    for series_id, label, unit, human_url in series:
+        api_url = f"https://api.bls.gov/publicAPI/v2/timeseries/data/{series_id}"
+        r = get(api_url)
+        payload = r.json()
+        if payload.get("status") != "REQUEST_SUCCEEDED":
+            raise RuntimeError(f"BLS API request failed for {series_id}: {payload.get('message', [])}")
+
+        rows = payload.get("Results", {}).get("series", [])
+        if not rows:
+            continue
+        data = rows[0].get("data", [])
+        # Ignore annual-average rows when present and use the two newest monthly values.
+        monthly = [d for d in data if str(d.get("period", "")).startswith("M") and d.get("period") != "M13"]
+        if not monthly:
+            continue
+
+        latest = monthly[0]
+        previous = monthly[1] if len(monthly) > 1 else None
+        value = str(latest.get("value", "")).strip()
+        period_name = latest.get("periodName") or latest.get("period") or ""
+        year = latest.get("year", "")
+
+        change_text = ""
+        if previous is not None:
+            try:
+                delta = float(value.replace(",", "")) - float(str(previous.get("value", "")).replace(",", ""))
+                sign = "+" if delta > 0 else ""
+                change_text = f"、前月比 {sign}{delta:g} {unit}"
+            except (TypeError, ValueError):
+                pass
+
+        title = f"{label}: {period_name} {year} = {value} {unit}"
+        summary = (
+            f"BLS公式Public Data API。{label}の最新値は {value} {unit}{change_text}。"
+            "市場予想との比較を含まないため、この数値だけではドル円の方向は自動確定しません。"
+        )
+        out.append(Item(source="BLS", title=title, url=human_url, summary=summary))
+
     return out
 
 

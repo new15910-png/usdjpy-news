@@ -7,7 +7,7 @@
 - 日本銀行: 「ニュース一覧」ページ
 - 財務省: 公式 RSS
 - FRB: Monetary Policy 公式 RSS
-- BLS: Employment Situation / CPI 公式 RSS
+- BLS: 公式 Public Data API（雇用者数・失業率・CPI）
 
 処理:
 1. 新着取得
@@ -32,6 +32,7 @@ python main.py
 ## 注意
 
 - Reuters は公式一般向けRSSではなく検索フィード経由です。本文の大量保存は行わず、見出し・概要・リンク中心に扱います。
+- BLS はクラウド環境でRSSが403になる場合があるため、公式 Public Data API を使用します（APIキー不要の小規模取得）。
 - 各サイトの利用規約やアクセス方針に従ってください。
 - 現段階の方向判定はルールベースです。次段階でLLM要約・重要度判定を追加できます。
 

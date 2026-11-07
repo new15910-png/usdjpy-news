@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -185,60 +186,104 @@ def collect_fed() -> list[Item]:
 
 
 def collect_bls() -> list[Item]:
-    """Collect key BLS indicators from the official Public Data API.
+    """Collect key BLS indicators with one batched API request.
 
-    The older prototype used BLS RSS endpoints, but some cloud providers
-    receive HTTP 403 responses from www.bls.gov.  The Public Data API is
-    intended for programmatic access and does not require an API key for
-    these small requests.
+    The previous prototype made one request per series. This version batches
+    all three series into a single POST request and caches successful results
+    for six hours. If the API is temporarily unavailable or the daily quota
+    is exhausted, the last successful cache is reused when available.
+    Set optional environment variable BLS_API_KEY to use a registered key.
     """
-    series = [
-        ("CES0000000001", "米国・非農業部門雇用者数", "千人", "https://www.bls.gov/news.release/empsit.nr0.htm"),
-        ("LNS14000000", "米国・失業率", "%", "https://www.bls.gov/news.release/empsit.nr0.htm"),
-        ("CUUR0000SA0", "米国・消費者物価指数（CPI-U）", "指数", "https://www.bls.gov/news.release/cpi.nr0.htm"),
-    ]
+    series_meta = {
+        "CES0000000001": ("米国・非農業部門雇用者数", "千人", "https://www.bls.gov/news.release/empsit.nr0.htm"),
+        "LNS14000000": ("米国・失業率", "%", "https://www.bls.gov/news.release/empsit.nr0.htm"),
+        "CUUR0000SA0": ("米国・消費者物価指数（CPI-U）", "指数", "https://www.bls.gov/news.release/cpi.nr0.htm"),
+    }
+    cache_path = OUT / "bls_cache.json"
+    cache_ttl = timedelta(hours=6)
 
-    out: list[Item] = []
-    for series_id, label, unit, human_url in series:
-        api_url = f"https://api.bls.gov/publicAPI/v2/timeseries/data/{series_id}"
-        r = get(api_url)
+    def load_bls_cache(allow_stale: bool = False) -> list[Item]:
+        if not cache_path.exists():
+            return []
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            fetched_at = datetime.fromisoformat(payload["fetched_at"])
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+            if not allow_stale and datetime.now(timezone.utc) - fetched_at > cache_ttl:
+                return []
+            return [Item(**row) for row in payload.get("items", [])]
+        except Exception:
+            return []
+
+    cached = load_bls_cache()
+    if cached:
+        return cached
+
+    request_body: dict[str, object] = {"seriesid": list(series_meta.keys())}
+    registration_key = os.environ.get("BLS_API_KEY", "").strip()
+    if registration_key:
+        request_body["registrationKey"] = registration_key
+
+    api_url = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+    try:
+        r = SESSION.post(api_url, json=request_body, timeout=TIMEOUT)
+        r.raise_for_status()
         payload = r.json()
         if payload.get("status") != "REQUEST_SUCCEEDED":
-            raise RuntimeError(f"BLS API request failed for {series_id}: {payload.get('message', [])}")
+            messages = payload.get("message", [])
+            stale = load_bls_cache(allow_stale=True)
+            if stale:
+                return stale
+            raise RuntimeError(f"BLS API request failed: {messages}")
 
-        rows = payload.get("Results", {}).get("series", [])
-        if not rows:
-            continue
-        data = rows[0].get("data", [])
-        # Ignore annual-average rows when present and use the two newest monthly values.
-        monthly = [d for d in data if str(d.get("period", "")).startswith("M") and d.get("period") != "M13"]
-        if not monthly:
-            continue
+        out: list[Item] = []
+        for row in payload.get("Results", {}).get("series", []):
+            series_id = row.get("seriesID")
+            if series_id not in series_meta:
+                continue
+            label, unit, human_url = series_meta[series_id]
+            data = row.get("data", [])
+            monthly = [d for d in data if str(d.get("period", "")).startswith("M") and d.get("period") != "M13"]
+            if not monthly:
+                continue
 
-        latest = monthly[0]
-        previous = monthly[1] if len(monthly) > 1 else None
-        value = str(latest.get("value", "")).strip()
-        period_name = latest.get("periodName") or latest.get("period") or ""
-        year = latest.get("year", "")
+            latest = monthly[0]
+            previous = monthly[1] if len(monthly) > 1 else None
+            value = str(latest.get("value", "")).strip()
+            period_name = latest.get("periodName") or latest.get("period") or ""
+            year = latest.get("year", "")
 
-        change_text = ""
-        if previous is not None:
-            try:
-                delta = float(value.replace(",", "")) - float(str(previous.get("value", "")).replace(",", ""))
-                sign = "+" if delta > 0 else ""
-                change_text = f"、前月比 {sign}{delta:g} {unit}"
-            except (TypeError, ValueError):
-                pass
+            change_text = ""
+            if previous is not None:
+                try:
+                    delta = float(value.replace(",", "")) - float(str(previous.get("value", "")).replace(",", ""))
+                    sign = "+" if delta > 0 else ""
+                    change_text = f"、前月比 {sign}{delta:g} {unit}"
+                except (TypeError, ValueError):
+                    pass
 
-        title = f"{label}: {period_name} {year} = {value} {unit}"
-        summary = (
-            f"BLS公式Public Data API。{label}の最新値は {value} {unit}{change_text}。"
-            "市場予想との比較を含まないため、この数値だけではドル円の方向は自動確定しません。"
-        )
-        out.append(Item(source="BLS", title=title, url=human_url, summary=summary))
+            title = f"{label}: {period_name} {year} = {value} {unit}"
+            summary = (
+                f"BLS公式Public Data API。{label}の最新値は {value} {unit}{change_text}。"
+                "市場予想との比較を含まないため、この数値だけではドル円の方向は自動確定しません。"
+            )
+            out.append(Item(source="BLS", title=title, url=human_url, summary=summary))
 
-    return out
-
+        if out:
+            cache_path.write_text(
+                json.dumps({
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    "items": [asdict(i) for i in out],
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return out
+    except Exception:
+        stale = load_bls_cache(allow_stale=True)
+        if stale:
+            return stale
+        raise
 
 def fetch_article_text(item: Item) -> None:
     if not CONFIG.get("fetch_article_text", True):
